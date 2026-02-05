@@ -30,7 +30,7 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     draw_status_bar(f, app, chunks[1]);
 }
 
-fn draw_browser(f: &mut Frame, app: &App, area: Rect) {
+fn draw_browser(f: &mut Frame, app: &mut App, area: Rect) {
     let items: Vec<ListItem> = app
         .items
         .iter()
@@ -90,7 +90,7 @@ fn draw_browser(f: &mut Frame, app: &App, area: Rect) {
                 .add_modifier(Modifier::BOLD),
         );
 
-    f.render_widget(browser, area);
+    f.render_stateful_widget(browser, area, &mut app.list_state);
 }
 
 fn draw_preview(f: &mut Frame, app: &mut App, area: Rect) {
@@ -107,7 +107,7 @@ fn draw_preview(f: &mut Frame, app: &mut App, area: Rect) {
         .border_style(Style::default().fg(Color::Cyan));
 
     let image_inner = image_block.inner(preview_chunks[0]);
-    
+
     // Store the preview area for image loading
     app.preview_area = Some(image_inner);
 
@@ -124,7 +124,7 @@ fn draw_preview(f: &mut Frame, app: &mut App, area: Rect) {
                 .alignment(Alignment::Center);
             f.render_widget(text, image_inner);
         } else if app.config.is_valid_image(selected) {
-            // Fast loading - show brief loading message
+            // Show loading message while image is being loaded
             let text = Paragraph::new("Loading...").alignment(Alignment::Center);
             f.render_widget(text, image_inner);
         }

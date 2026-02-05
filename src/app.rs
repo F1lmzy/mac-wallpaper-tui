@@ -1,18 +1,20 @@
-use anyhow::Result;
-use std::path::PathBuf;
-use ratatui_image::protocol::StatefulProtocol;
-use rand::seq::SliceRandom;
-use crate::preview::{CachedImage, ImageCache};
-use crate::database::Database;
 use crate::config::Config;
+use crate::database::Database;
+use crate::preview::{CachedImage, ImageCache};
+use anyhow::Result;
+use rand::seq::SliceRandom;
+use ratatui_image::protocol::StatefulProtocol;
+use std::path::PathBuf;
 
 use ratatui::layout::Rect;
+use ratatui::widgets::ListState;
 
 pub struct App {
     pub root_dir: PathBuf,
     pub current_dir: PathBuf,
     pub items: Vec<PathBuf>,
     pub selected_index: usize,
+    pub list_state: ListState,
     pub image_cache: ImageCache,
     pub current_preview: Option<CachedImage>,
     pub current_protocol: Option<StatefulProtocol>,
@@ -23,6 +25,9 @@ pub struct App {
     pub database: Database,
     pub config: Config,
     pub preview_area: Option<Rect>,
+    pub last_preview_area: Option<Rect>,
+    pub last_click_time: std::time::Instant,
+    pub last_click_index: Option<usize>,
 }
 
 impl App {
@@ -35,12 +40,16 @@ impl App {
         let database = Database::new()?;
         let favorites = database.get_favorites()?;
         let recent_wallpapers = database.get_recent_wallpapers(10)?;
-        
+
+        let mut list_state = ListState::default();
+        list_state.select(Some(0));
+
         let mut app = Self {
             root_dir,
             current_dir,
             items,
             selected_index: 0,
+            list_state,
             image_cache,
             current_preview: None,
             current_protocol: None,
@@ -51,52 +60,55 @@ impl App {
             database,
             config,
             preview_area: None,
+            last_preview_area: None,
+            last_click_time: std::time::Instant::now(),
+            last_click_index: None,
         };
-        
-        // Load initial preview
-        app.update_preview().await;
-        
+
+        // Initial preview will be loaded after first UI render when preview_area is set
+
         Ok(app)
     }
 
     fn list_directory(path: &PathBuf, root_dir: &PathBuf, config: &Config) -> Vec<PathBuf> {
         let mut items = vec![];
-        
+
         // Only add ".." if we're not at the root directory
         if path != root_dir {
             items.push(PathBuf::from(".."));
         }
-        
+
         if let Ok(entries) = std::fs::read_dir(path) {
             let mut dirs = vec![];
             let mut files = vec![];
-            
+
             for entry in entries.flatten() {
                 let path = entry.path();
                 if path.is_dir() {
                     dirs.push(path);
                 } else {
                     // Only include image files
-                    if config.is_valid_wallpaper(&path) {
+                    if config.is_valid_image(&path) {
                         files.push(path);
                     }
                 }
             }
-            
+
             // Sort directories first, then files
             dirs.sort();
             files.sort();
-            
+
             items.extend(dirs);
             items.extend(files);
         }
-        
+
         items
     }
 
     pub async fn next(&mut self) {
         if !self.items.is_empty() {
             self.selected_index = (self.selected_index + 1) % self.items.len();
+            self.list_state.select(Some(self.selected_index));
             self.update_preview().await;
         }
     }
@@ -108,6 +120,7 @@ impl App {
             } else {
                 self.selected_index -= 1;
             }
+            self.list_state.select(Some(self.selected_index));
             self.update_preview().await;
         }
     }
@@ -120,8 +133,12 @@ impl App {
             }
             self.show_recent = false;
             self.items = Self::list_directory(&self.current_dir, &self.root_dir, &self.config);
+            self.selected_index = 0;
+            self.list_state.select(Some(0));
             // Preload all images in the directory
-            let image_paths: Vec<PathBuf> = self.items.iter()
+            let image_paths: Vec<PathBuf> = self
+                .items
+                .iter()
                 .filter(|p| self.config.is_valid_image(p))
                 .cloned()
                 .collect();
@@ -129,22 +146,29 @@ impl App {
         } else if let Some(selected) = self.items.get(self.selected_index) {
             let new_path = if selected.file_name() == Some(std::ffi::OsStr::new("..")) {
                 // Only allow going up if parent is still within root
-                self.current_dir.parent().filter(|p| p.starts_with(&self.root_dir)).map(|p| p.to_path_buf())
+                self.current_dir
+                    .parent()
+                    .filter(|p| p.starts_with(&self.root_dir))
+                    .map(|p| p.to_path_buf())
             } else {
                 Some(selected.clone())
             };
-            
+
             if let Some(new_path) = new_path {
                 if new_path.is_dir() {
                     self.current_dir = new_path;
-                    self.items = Self::list_directory(&self.current_dir, &self.root_dir, &self.config);
+                    self.items =
+                        Self::list_directory(&self.current_dir, &self.root_dir, &self.config);
                     // Preload all images in the directory
-                    let image_paths: Vec<PathBuf> = self.items.iter()
+                    let image_paths: Vec<PathBuf> = self
+                        .items
+                        .iter()
                         .filter(|p| self.config.is_valid_image(p))
                         .cloned()
                         .collect();
                     self.image_cache.preload_all(image_paths);
                     self.selected_index = 0;
+                    self.list_state.select(Some(0));
                     self.update_preview().await;
                 }
             }
@@ -156,12 +180,15 @@ impl App {
             self.show_recent = false;
             self.items = Self::list_directory(&self.current_dir, &self.root_dir, &self.config);
             // Preload all images in the directory
-            let image_paths: Vec<PathBuf> = self.items.iter()
+            let image_paths: Vec<PathBuf> = self
+                .items
+                .iter()
                 .filter(|p| self.config.is_valid_image(p))
                 .cloned()
                 .collect();
             self.image_cache.preload_all(image_paths);
             self.selected_index = 0;
+            self.list_state.select(Some(0));
             self.update_preview().await;
         } else if let Some(parent) = self.current_dir.parent() {
             // Only go back if parent is still within or equal to root
@@ -169,27 +196,35 @@ impl App {
                 self.current_dir = parent.to_path_buf();
                 self.items = Self::list_directory(&self.current_dir, &self.root_dir, &self.config);
                 // Preload all images in the directory
-                let image_paths: Vec<PathBuf> = self.items.iter()
+                let image_paths: Vec<PathBuf> = self
+                    .items
+                    .iter()
                     .filter(|p| self.config.is_valid_image(p))
                     .cloned()
                     .collect();
                 self.image_cache.preload_all(image_paths);
                 self.selected_index = 0;
+                self.list_state.select(Some(0));
                 self.update_preview().await;
             }
         }
     }
 
-    async fn update_preview(&mut self) {
+    pub async fn update_preview(&mut self) {
+        // Only update if we have a preview area set
+        if self.preview_area.is_none() {
+            return;
+        }
+
         self.current_preview = None;
         self.current_protocol = None;
-        
+
         let selected = if self.show_recent {
             self.recent_wallpapers.get(self.selected_index)
         } else {
             self.items.get(self.selected_index)
         };
-        
+
         if let Some(path) = selected {
             if path.is_file() {
                 // Fast path: load image immediately (uses thumbnail cache internally)
@@ -212,6 +247,16 @@ impl App {
                 }
             }
         }
+
+        // Always update last_preview_area to prevent repeated area-change checks
+        self.last_preview_area = self.preview_area;
+    }
+
+    pub async fn check_and_reload_preview(&mut self) {
+        // Reload preview if area has changed
+        if self.preview_area.is_some() && self.preview_area != self.last_preview_area {
+            self.update_preview().await;
+        }
     }
 
     pub fn toggle_favorite(&mut self) {
@@ -220,7 +265,7 @@ impl App {
         } else {
             self.items.get(self.selected_index)
         };
-        
+
         if let Some(path) = selected {
             if path.is_file() {
                 let path = path.clone();
@@ -252,7 +297,9 @@ impl App {
             self.show_recent = false;
             self.items = Self::list_directory(&self.current_dir, &self.root_dir, &self.config);
             // Preload all images in the directory
-            let image_paths: Vec<PathBuf> = self.items.iter()
+            let image_paths: Vec<PathBuf> = self
+                .items
+                .iter()
                 .filter(|p| self.config.is_valid_image(p))
                 .cloned()
                 .collect();
@@ -265,7 +312,9 @@ impl App {
                 self.show_recent = false;
                 self.items = Self::list_directory(&self.current_dir, &self.root_dir, &self.config);
                 // Preload all images in the directory
-                let image_paths: Vec<PathBuf> = self.items.iter()
+                let image_paths: Vec<PathBuf> = self
+                    .items
+                    .iter()
                     .filter(|p| self.config.is_valid_image(p))
                     .cloned()
                     .collect();
@@ -273,24 +322,25 @@ impl App {
             }
         }
         self.selected_index = 0;
+        self.list_state.select(Some(0));
     }
 
     pub async fn set_random_wallpaper(&mut self) -> Result<()> {
         // Collect all wallpaper files from current directory and subdirectories
         let mut all_images = vec![];
         self.collect_images(&self.current_dir, &mut all_images)?;
-        
+
         if all_images.is_empty() {
             self.status_message = Some("No images found".to_string());
             return Ok(());
         }
-        
+
         // Select random image
         let mut rng = rand::thread_rng();
         if let Some(path) = all_images.choose(&mut rng) {
             self.set_wallpaper_from_path(path).await?;
         }
-        
+
         Ok(())
     }
 
@@ -317,7 +367,7 @@ impl App {
         } else {
             self.items.get(self.selected_index).cloned()
         };
-        
+
         if let Some(path) = path {
             if path.is_file() {
                 self.set_wallpaper_from_path(&path).await?;
@@ -332,18 +382,19 @@ impl App {
             r#"tell application "System Events" to tell every desktop to set picture to "{}""#,
             path_str
         );
-        
+
         let output = std::process::Command::new("osascript")
             .arg("-e")
             .arg(&script)
             .output()?;
-        
+
         if output.status.success() {
-            let name = path.file_name()
+            let name = path
+                .file_name()
                 .map(|n| n.to_string_lossy().to_string())
                 .unwrap_or_else(|| path.to_string_lossy().to_string());
             self.status_message = Some(format!("Set wallpaper: {}", name));
-            
+
             // Add to recent wallpapers
             if let Err(e) = self.database.add_recent_wallpaper(path) {
                 eprintln!("Failed to add to recent: {}", e);
@@ -354,7 +405,7 @@ impl App {
             self.status_message = Some(format!("Failed: {}", stderr));
             return Err(anyhow::anyhow!("Failed to set wallpaper: {}", stderr));
         }
-        
+
         Ok(())
     }
 
@@ -362,8 +413,30 @@ impl App {
         self.status_message = None;
     }
 
-    pub fn on_tick(&mut self) {
-        // Clear status messages after a few seconds (placeholder)
+    pub async fn on_tick(&mut self) {
+        // Retry loading preview if we don't have one but should
+        if self.current_protocol.is_none() {
+            let selected = if self.show_recent {
+                self.recent_wallpapers.get(self.selected_index)
+            } else {
+                self.items.get(self.selected_index)
+            };
+
+            if let Some(path) = selected {
+                if path.is_file() && self.config.is_valid_image(path) {
+                    // Try loading again - might be ready from background preload
+                    if let Ok(Some(result)) =
+                        self.image_cache.get_image(path, self.preview_area).await
+                    {
+                        self.current_preview = Some(CachedImage {
+                            dimensions: result.dimensions,
+                            size_bytes: 0,
+                        });
+                        self.current_protocol = Some(result.protocol);
+                    }
+                }
+            }
+        }
     }
 
     pub fn selected_item(&self) -> Option<&PathBuf> {
@@ -371,6 +444,49 @@ impl App {
             self.recent_wallpapers.get(self.selected_index)
         } else {
             self.items.get(self.selected_index)
+        }
+    }
+
+    pub async fn handle_mouse_click(
+        &mut self,
+        row: u16,
+        browser_area: ratatui::layout::Rect,
+        double_click: bool,
+    ) {
+        // Calculate which item was clicked based on row position
+        // Adjust for borders (1 line top border, 1 line title)
+        if row >= browser_area.y + 2 && row < browser_area.y + browser_area.height - 1 {
+            let clicked_index = (row - browser_area.y - 2) as usize;
+
+            if clicked_index < self.items.len() {
+                if double_click {
+                    // Double click - set wallpaper if it's an image
+                    self.selected_index = clicked_index;
+                    self.list_state.select(Some(self.selected_index));
+                    if let Err(e) = self.set_wallpaper().await {
+                        eprintln!("Error setting wallpaper: {:?}", e);
+                    }
+                } else {
+                    // Single click - preview
+                    self.selected_index = clicked_index;
+                    self.list_state.select(Some(self.selected_index));
+                    self.update_preview().await;
+                }
+            }
+        }
+    }
+
+    pub fn scroll_up(&mut self) {
+        if self.selected_index > 0 {
+            self.selected_index -= 1;
+            self.list_state.select(Some(self.selected_index));
+        }
+    }
+
+    pub fn scroll_down(&mut self) {
+        if self.selected_index + 1 < self.items.len() {
+            self.selected_index += 1;
+            self.list_state.select(Some(self.selected_index));
         }
     }
 }
